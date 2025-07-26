@@ -76,6 +76,8 @@ def read_parser():
         	optional_train.add_argument('--bsort', required=False, default=False, action='store_true', help="In prpeprocess, by deafult we sort bam using unix sort but sometimes LC collate can cause issues, so this can be set to use betools sort which works well but is memory intensive..")
         	optional_train.add_argument('--tmpdir', required=False, default=None, type=str, help="temp dir for unix sort")
         	optional_train.add_argument('--no-st', required=False, default=False, action='store_true', help="Dont do streaming  and filtering in preprocessing (short chromosome contrigs not in reference fasta are not removed)")
+        	optional_train.add_argument('--vcf-file', type=str, default=None, help="VCF/BCF file containing variants for personalized genome")
+        	optional_train.add_argument('--sample-id', type=str, default=None, help="Sample ID to extract genotypes from VCF for personalized genome")
 
         	return required_train, optional_train
 
@@ -295,4 +297,3 @@ def read_parser():
         args = parser.parse_args()
 
         return args
-

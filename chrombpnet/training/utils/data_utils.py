@@ -4,6 +4,7 @@ import pyBigWig
 import pyfaidx
 import pysam
 from chrombpnet.training.utils import one_hot
+from tqdm import tqdm
 
 
 class PersonalizedGenome:
@@ -165,6 +166,166 @@ class PersonalizedChromosome:
             raise TypeError("Invalid key type")
 
 
+def load_vcf_to_dataframe(vcf_file, sample_id):
+    """
+    Load VCF file into a dictionary of chromosome -> DataFrame for efficient lookup.
+    
+    Args:
+        vcf_file: Path to VCF/BCF file
+        sample_id: Sample ID to extract genotypes from
+    
+    Returns:
+        Dictionary mapping chromosome -> DataFrame with POS, REF, ALT, and genotype columns
+    """
+    chromo_vcf_df = {}
+    
+    print(f"Loading VCF data from {vcf_file} for sample {sample_id}")
+    
+    with pysam.VariantFile(vcf_file, "rb") as vcf:
+        if sample_id not in vcf.header.samples:
+            raise ValueError(f"Sample {sample_id} not found in VCF file")
+        
+        for record in vcf.fetch():
+            # Get genotype for the sample
+            sample_gt = record.samples[sample_id]['GT']
+            if sample_gt is None or sample_gt == (None, None):
+                continue
+            
+            # Convert genotype to string format
+            if "|" in str(record.samples[sample_id]):
+                # Phased
+                genotype_str = f"{sample_gt[0]}|{sample_gt[1]}"
+            else:
+                # Unphased
+                genotype_str = f"{sample_gt[0]}/{sample_gt[1]}"
+            
+            # Create variant record
+            variant_record = {
+                'POS': record.pos,
+                'REF': record.ref,
+                'ALT': record.alts[0] if record.alts else record.ref,
+                'GENOTYPE': genotype_str
+            }
+            
+            # Add to chromosome dictionary
+            chrom = record.chrom
+            if chrom not in chromo_vcf_df:
+                chromo_vcf_df[chrom] = []
+            chromo_vcf_df[chrom].append(variant_record)
+    
+    # Convert lists to DataFrames for efficient filtering
+    for chrom in chromo_vcf_df:
+        chromo_vcf_df[chrom] = pd.DataFrame(chromo_vcf_df[chrom])
+        chromo_vcf_df[chrom] = chromo_vcf_df[chrom].sort_values('POS')
+    
+    print(f"Loaded variants for {len(chromo_vcf_df)} chromosomes")
+    return chromo_vcf_df
+
+
+def get_seq_with_variants(peaks_df, genome, width, chromo_vcf_df):
+    """
+    Fetches sequence from genome with variant substitution, creating two haplotypes and averaging them.
+    
+    Args:
+        peaks_df: DataFrame with chr, start, summit columns
+        genome: Reference genome object
+        width: Width of sequence to extract
+        chromo_vcf_df: Dictionary of chromosome -> variant DataFrames
+    
+    Returns:
+        N x L x 4 NumPy array of averaged one-hot encodings
+    """
+    first_vals = []
+    second_vals = []
+    
+    for p_i, r in tqdm(peaks_df.iterrows(), total=len(peaks_df), desc="Processing sequences"):
+        chromo = r['chr']
+        summit = r['start'] + r['summit']
+        start = summit - width // 2
+        end = summit + width // 2
+
+        # Get reference sequence
+        sequence = str(genome[r['chr']][start:end])
+        
+        # Normalize chromosome name for VCF lookup
+        if chromo.startswith('chr'):
+            if chromo in ['chrX', 'chrY']:
+                chromo_key = chromo
+            else:
+                chromo_key = int(chromo[3:])
+        else:
+            chromo_key = chromo
+
+        # Get variants in this region
+        c_df = chromo_vcf_df.get(chromo_key, [])
+        if len(c_df) == 0:
+            variants = []
+        else:
+            variants = c_df[(c_df['POS'] > start) & (c_df['POS'] < end)]
+
+        # Create two haplotypes
+        first_hap_seq = sequence
+        second_hap_seq = sequence
+        
+        if len(variants) > 0:
+            for i, v in variants.iterrows():
+                pos = v['POS']
+                ref = v['REF']
+                alt = v['ALT']
+                
+                # Skip INDELs for now (can be extended later)
+                if len(ref) > 1 or len(alt) > 1:
+                    continue
+                
+                # Parse genotype
+                genotype = v['GENOTYPE']
+                
+                if "|" in genotype:
+                    # Phased genotype (e.g., "0|1")
+                    first_hap, second_hap = genotype.split("|")
+                elif "/" in genotype:
+                    # Unphased genotype (e.g., "0/1")
+                    first_hap, second_hap = genotype.split("/")
+                else:
+                    # Single allele (e.g., "1")
+                    first_hap = second_hap = genotype
+                
+                first_hap, second_hap = int(first_hap), int(second_hap)
+                
+                # Convert to 0-based position relative to sequence
+                pos = pos - start - 1
+                
+                # Validate position and reference allele
+                if pos < 0 or pos + len(ref) > len(sequence):
+                    continue
+                    
+                if sequence[pos:pos+len(ref)].upper() != ref.upper():
+                    print(f"Warning: Reference mismatch at {chromo}:{pos+start+1}")
+                    print(f"Expected: {ref}, Found: {sequence[pos:pos+len(ref)]}")
+                    continue
+                
+                # Apply variants to haplotypes
+                if first_hap == 1:
+                    first_hap_seq = first_hap_seq[:pos] + alt + first_hap_seq[pos+len(ref):]
+                if second_hap == 1:
+                    second_hap_seq = second_hap_seq[:pos] + alt + second_hap_seq[pos+len(ref):]
+                
+                # Validate sequence lengths
+                if len(first_hap_seq) != width or len(second_hap_seq) != width:
+                    print(f"Warning: Sequence length mismatch after variant application")
+                    continue
+        
+        first_vals.append(first_hap_seq.upper())
+        second_vals.append(second_hap_seq.upper())
+
+    # Convert to one-hot and average
+    first_vals = one_hot.dna_to_one_hot(first_vals)
+    second_vals = one_hot.dna_to_one_hot(second_vals)
+    vals = np.add(first_vals, second_vals) / 2
+    
+    return vals
+
+
 def get_seq(peaks_df, genome, width, chromo_vcf_df=None):
     """
     Fetches sequence from a given genome, with optional variant substitution.
@@ -235,7 +396,6 @@ def load_data(bed_regions, nonpeak_regions, genome_fasta, cts_bw_file, inputlen,
     if vcf_file and sample_id:
         print(f"Loading VCF data from {vcf_file} for sample {sample_id}")
         chromo_vcf_df = load_vcf_to_dataframe(vcf_file, sample_id)
-        print(f"Loaded variants for {len(chromo_vcf_df)} chromosomes")
     
     train_peaks_seqs = None
     train_peaks_cts = None
@@ -261,168 +421,3 @@ def load_data(bed_regions, nonpeak_regions, genome_fasta, cts_bw_file, inputlen,
 
     return (train_peaks_seqs, train_peaks_cts, train_peaks_coords,
             train_nonpeaks_seqs, train_nonpeaks_cts, train_nonpeaks_coords)
-
-
-def get_seq_with_variants(peaks_df, genome, width, chromo_vcf_df, use_phased=True):
-    """
-    Fetches sequence from genome with variant substitution, creating two haplotypes and averaging them.
-    
-    Args:
-        peaks_df: DataFrame with chr, start, summit columns
-        genome: Reference genome object
-        width: Width of sequence to extract
-        chromo_vcf_df: Dictionary of chromosome -> variant DataFrames
-        use_phased: If True, use phased genotypes (|), otherwise use unphased (/)
-    
-    Returns:
-        N x L x 4 NumPy array of averaged one-hot encodings
-    """
-    from tqdm import tqdm
-    import numpy as np
-    
-    first_vals = []
-    second_vals = []
-    
-    for p_i, r in tqdm(peaks_df.iterrows(), total=len(peaks_df), desc="Processing sequences"):
-        chromo = r['chr']
-        summit = r['start'] + r['summit']
-        start = summit - width // 2
-        end = summit + width // 2
-
-        # Get reference sequence
-        sequence = str(genome[r['chr']][start:end])
-        
-        # Normalize chromosome name for VCF lookup
-        if chromo.startswith('chr'):
-            if chromo in ['chrX', 'chrY']:
-                chromo_key = chromo
-            else:
-                chromo_key = int(chromo[3:])
-        else:
-            chromo_key = chromo
-
-        # Get variants in this region
-        c_df = chromo_vcf_df.get(chromo_key, [])
-        if len(c_df) == 0:
-            variants = []
-        else:
-            variants = c_df[(c_df['POS'] > start) & (c_df['POS'] < end)]
-
-        # Create two haplotypes
-        first_hap_seq = sequence
-        second_hap_seq = sequence
-        
-        if len(variants) > 0:
-            for i, v in variants.iterrows():
-                pos = v['POS']
-                ref = v['REF']
-                alt = v['ALT']
-                
-                # Skip INDELs for now (can be extended later)
-                if len(ref) > 1 or len(alt) > 1:
-                    continue
-                
-                # Parse genotype
-                genotype = v.values[-1]
-                genotype = genotype.split(":")[0]
-                
-                if use_phased and "|" in genotype:
-                    # Phased genotype (e.g., "0|1")
-                    first_hap, second_hap = genotype.split("|")
-                elif "/" in genotype:
-                    # Unphased genotype (e.g., "0/1")
-                    first_hap, second_hap = genotype.split("/")
-                else:
-                    # Single allele (e.g., "1")
-                    first_hap = second_hap = genotype
-                
-                first_hap, second_hap = int(first_hap), int(second_hap)
-                
-                # Convert to 0-based position relative to sequence
-                pos = pos - start - 1
-                
-                # Validate position and reference allele
-                if pos < 0 or pos + len(ref) > len(sequence):
-                    continue
-                    
-                if sequence[pos:pos+len(ref)].upper() != ref.upper():
-                    print(f"Warning: Reference mismatch at {chromo}:{pos+start+1}")
-                    print(f"Expected: {ref}, Found: {sequence[pos:pos+len(ref)]}")
-                    continue
-                
-                # Apply variants to haplotypes
-                if first_hap == 1:
-                    first_hap_seq = first_hap_seq[:pos] + alt + first_hap_seq[pos+len(ref):]
-                if second_hap == 1:
-                    second_hap_seq = second_hap_seq[:pos] + alt + second_hap_seq[pos+len(ref):]
-                
-                # Validate sequence lengths
-                if len(first_hap_seq) != width or len(second_hap_seq) != width:
-                    print(f"Warning: Sequence length mismatch after variant application")
-                    continue
-        
-        first_vals.append(first_hap_seq.upper())
-        second_vals.append(second_hap_seq.upper())
-
-    # Convert to one-hot and average
-    first_vals = one_hot.dna_to_one_hot(first_vals)
-    second_vals = one_hot.dna_to_one_hot(second_vals)
-    vals = np.add(first_vals, second_vals) / 2
-    
-    return vals
-
-
-def load_vcf_to_dataframe(vcf_file, sample_id):
-    """
-    Load VCF file into a dictionary of chromosome -> DataFrame for efficient lookup.
-    
-    Args:
-        vcf_file: Path to VCF/BCF file
-        sample_id: Sample ID to extract genotypes from
-    
-    Returns:
-        Dictionary mapping chromosome -> DataFrame with POS, REF, ALT, and genotype columns
-    """
-    import pandas as pd
-    import pysam
-    
-    chromo_vcf_df = {}
-    
-    with pysam.VariantFile(vcf_file, "rb") as vcf:
-        if sample_id not in vcf.header.samples:
-            raise ValueError(f"Sample {sample_id} not found in VCF file")
-        
-        for record in vcf.fetch():
-            # Get genotype for the sample
-            sample_gt = record.samples[sample_id]['GT']
-            if sample_gt is None or sample_gt == (None, None):
-                continue
-            
-            # Convert genotype to string format
-            if "|" in str(record.samples[sample_id]):
-                # Phased
-                genotype_str = f"{sample_gt[0]}|{sample_gt[1]}"
-            else:
-                # Unphased
-                genotype_str = f"{sample_gt[0]}/{sample_gt[1]}"
-            
-            # Create variant record
-            variant_record = {
-                'POS': record.pos,
-                'REF': record.ref,
-                'ALT': record.alts[0] if record.alts else record.ref,
-                'GENOTYPE': genotype_str
-            }
-            
-            # Add to chromosome dictionary
-            chrom = record.chrom
-            if chrom not in chromo_vcf_df:
-                chromo_vcf_df[chrom] = []
-            chromo_vcf_df[chrom].append(variant_record)
-    
-    # Convert lists to DataFrames for efficient filtering
-    for chrom in chromo_vcf_df:
-        chromo_vcf_df[chrom] = pd.DataFrame(chromo_vcf_df[chrom])
-        chromo_vcf_df[chrom] = chromo_vcf_df[chrom].sort_values('POS')
-    
-    return chromo_vcf_df
