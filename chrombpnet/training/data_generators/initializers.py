@@ -49,11 +49,22 @@ def fetch_data_and_model_params_based_on_mode(mode, args, parameters, nonpeak_re
     return inputlen, outputlen,  nonpeak_regions, negative_sampling_ratio, max_jitter, add_revcomp, shuffle_at_epoch_start
 
 
-def get_bed_regions_for_fold_split(bed_regions, mode, splits_dict):
-    chroms_to_keep=splits_dict[mode]
-    bed_regions_to_keep=bed_regions[bed_regions["chr"].isin(chroms_to_keep)]
-    print("got split:"+str(mode)+" for bed regions:"+str(bed_regions_to_keep.shape))
-    return bed_regions_to_keep, chroms_to_keep
+def get_bed_regions_for_fold_split(regions, mode, splits_dict):
+    """
+    Filter bed regions based on fold split.
+    """
+    if mode == "train":
+        chroms = splits_dict["train"]
+    elif mode == "valid":
+        chroms = splits_dict["valid"]
+    elif mode == "test":
+        chroms = splits_dict["test"]
+    else:
+        raise ValueError("mode must be train, valid, or test")
+    
+    filtered_regions = regions[regions['chr'].isin(chroms)]
+    return filtered_regions, chroms
+
 
 def initialize_generators(args, mode, parameters, return_coords):
 
@@ -77,6 +88,11 @@ def initialize_generators(args, mode, parameters, return_coords):
     inputlen, outputlen, \
     nonpeak_regions, negative_sampling_ratio, \
     max_jitter, add_revcomp, shuffle_at_epoch_start  =  fetch_data_and_model_params_based_on_mode(mode, args, parameters, nonpeak_regions, peak_regions)
+    
+    # Get VCF parameters if provided
+    vcf_file = getattr(args, 'vcf_file', None)
+    sample_id = getattr(args, 'sample_id', None)
+    
     generator=batchgen_generator.ChromBPNetBatchGenerator(
                                     peak_regions=peak_regions,
                                     nonpeak_regions=nonpeak_regions,
@@ -89,7 +105,9 @@ def initialize_generators(args, mode, parameters, return_coords):
                                     cts_bw_file=args.bigwig,
                                     add_revcomp=add_revcomp,
                                     return_coords=return_coords,
-                                    shuffle_at_epoch_start=shuffle_at_epoch_start
+                                    shuffle_at_epoch_start=shuffle_at_epoch_start,
+                                    vcf_file=vcf_file,
+                                    sample_id=sample_id
                                     )
     
     return generator

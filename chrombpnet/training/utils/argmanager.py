@@ -7,6 +7,8 @@ def update_data_args(parser):
     parser.add_argument("-n", "--nonpeaks", type=str, default="None" ,help="10 column bed file of non-peak regions, centered at summit (10th column)")
     parser.add_argument("-o", "--output_prefix", type=str, required=True, help="Output prefix")
     parser.add_argument("-fl", "--chr_fold_path", type=str, required=True, help="Fold information - see splits.py to set folds")
+    parser.add_argument("--vcf_file", type=str, default=None, help="VCF/BCF file containing variants for personalized genome")
+    parser.add_argument("--sample_id", type=str, default=None, help="Sample ID to extract genotypes from VCF for personalized genome")
 
 
 def update_train_args(parser):
